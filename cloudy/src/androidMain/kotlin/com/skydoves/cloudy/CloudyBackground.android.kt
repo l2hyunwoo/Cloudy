@@ -44,9 +44,13 @@ import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.RenderEffect as ComposeRenderEffect
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScrollModifierNode
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.node.CompositionLocalConsumerModifierNode
+import androidx.compose.ui.node.DelegatingNode
 import androidx.compose.ui.node.DrawModifierNode
 import androidx.compose.ui.node.GlobalPositionAwareModifierNode
 import androidx.compose.ui.node.LayoutAwareModifierNode
@@ -57,6 +61,7 @@ import androidx.compose.ui.node.requireGraphicsContext
 import androidx.compose.ui.platform.InspectorInfo
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.toSize
 import com.skydoves.cloudy.internals.SkySnapshot
 import com.skydoves.cloudy.internals.render.RenderScriptToolkit
@@ -140,19 +145,42 @@ private data class SkyModifierElement(val sky: Sky) : ModifierNodeElement<SkyMod
 }
 
 private class SkyModifierNode(var sky: Sky) :
-  Modifier.Node(),
+  DelegatingNode(),
   DrawModifierNode,
   GlobalPositionAwareModifierNode {
 
   private var graphicsLayer: GraphicsLayer? = null
   private var positionInRoot: Offset = Offset.Zero
 
-  // Throttle version increments to reduce blur processing frequency
-  private var lastVersionIncrementTime: Long = 0L
+  // Stable invalidator the frame driver pumps each scroll frame to re-capture the moved backdrop.
+  private val recapture: () -> Unit = { if (isAttached) invalidateDraw() }
 
-  companion object {
-    // Only increment version every 100ms to prevent excessive blur updates
-    private const val VERSION_INCREMENT_INTERVAL_MS = 100L
+  // Forward descendant scroll/fling deltas to the frame driver: this is the precise "the backdrop is
+  // moving now" signal the draw phase lacks (a LazyColumn scroll does not re-invoke this recorder's
+  // draw). The driver re-captures + re-blurs while scrolling, then parks so the app idles.
+  private val scrollConnection = object : NestedScrollConnection {
+    override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+      sky.frameDriver.onScrollActivity()
+      return Offset.Zero
+    }
+
+    override suspend fun onPreFling(available: Velocity): Velocity {
+      sky.frameDriver.onScrollActivity()
+      return Velocity.Zero
+    }
+
+    override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+      sky.frameDriver.onScrollActivity()
+      return Velocity.Zero
+    }
+  }
+
+  init {
+    delegate(nestedScrollModifierNode(scrollConnection, dispatcher = null))
+  }
+
+  override fun onAttach() {
+    sky.frameDriver.attachRecorder(coroutineScope, recapture)
   }
 
   override fun onGloballyPositioned(coordinates: LayoutCoordinates) {
@@ -165,43 +193,27 @@ private class SkyModifierNode(var sky: Sky) :
 
   override fun ContentDrawScope.draw() {
     val context = requireGraphicsContext()
-    val newlyCreated = graphicsLayer == null
     val layer = graphicsLayer ?: context.createGraphicsLayer().also {
       graphicsLayer = it
     }
 
-    // Record the background into `layer`, the source a descendant `cloudy` overlay samples
-    // and blurs. `isCapturing` is set so the overlay draws nothing during this pass: it must be
-    // ABSENT from the blur source. Otherwise the overlay would draw its blur layer into `layer`,
-    // and that blur layer in turn samples `layer` — a cyclic RenderNode graph that overflows the
-    // render thread stack (https://github.com/skydoves/Cloudy/issues/112).
-    sky.isCapturing = true
-    try {
+    // Record the background into `layer`, the source a `cloudy` overlay of this sky samples and
+    // blurs. `sky.capturing` marks the sky as recording so its overlays draw nothing during this
+    // pass: an overlay must be ABSENT from the blur source. Otherwise the overlay would draw its
+    // blur layer into the layer being recorded, and that blur layer in turn samples a backdrop
+    // layer — a cyclic RenderNode graph that overflows the render thread stack
+    // (https://github.com/skydoves/Cloudy/issues/112).
+    sky.capturing {
       layer.record {
         this@draw.drawContent()
       }
-    } finally {
-      sky.isCapturing = false
     }
 
-    // `layer` is reused across draws, so publish it to the snapshot state ONCE (when first
-    // created). Re-assigning the same instance every draw would write snapshot state that the
-    // descendant overlay reads in its own draw, invalidating it and triggering an endless redraw
-    // loop that keeps the window producing frames even while idle.
-    if (newlyCreated) {
-      sky.backgroundLayer = layer
-    }
-
-    // Re-recording `layer` above re-captures the current backdrop, so bump the content version
-    // that the legacy (API < 31) bitmap path keys its cache on. Throttle it: an unconditional
-    // per-draw bump writes snapshot state read during the overlay's draw, which re-invalidates
-    // the overlay and self-perpetuates the redraw loop, so the app never goes idle. Rate-limiting
-    // lets the tree settle to zero frames once the backdrop stops changing.
-    val now = System.currentTimeMillis()
-    if (now - lastVersionIncrementTime >= VERSION_INCREMENT_INTERVAL_MS) {
-      lastVersionIncrementTime = now
-      sky.incrementContentVersion()
-    }
+    // Publish the just-captured backdrop. A PLAIN (non-snapshot) field, written every draw: the
+    // overlay re-reads it each time it draws and the frame driver is what re-runs the overlay, so
+    // no snapshot observation is needed. Writing it as snapshot state per draw is what created the
+    // original idle redraw loop (the descendant overlay observed the write and forced a frame).
+    sky.backgroundLayer = layer
 
     // Draw the subtree to the window. `isCapturing` is now false, so the overlay paints its
     // blurred backdrop (sampling `layer`, which contains no reference back to the overlay) and
@@ -211,6 +223,7 @@ private class SkyModifierNode(var sky: Sky) :
   }
 
   override fun onDetach() {
+    sky.frameDriver.detachRecorder(coroutineScope)
     graphicsLayer?.let { requireGraphicsContext().releaseGraphicsLayer(it) }
     graphicsLayer = null
     sky.backgroundLayer = null
@@ -273,13 +286,17 @@ private class CloudyBackgroundModifierNode(
   private var positionInRoot: Offset = Offset.Zero
   private var size: IntSize = IntSize.Zero
 
+  // Stable re-blur invalidator the frame driver pumps each frame the backdrop moves. A field (not a
+  // fresh lambda per call) so the driver can identity-match it on add/remove.
+  private val reblur: () -> Unit = { if (isAttached) invalidateDraw() }
+
   // Cached GPU blur layer + RenderEffect (API 31+). Reused across draws; the effect is rebuilt only
   // when the blur radius changes (it is size-independent), so a steady-state frame allocates nothing.
   private var blurLayer: GraphicsLayer? = null
   private var cachedBlurEffect: ComposeRenderEffect? = null
   private var cachedBlurRadius: Float = -1f
 
-  // Reusable Path for the shape clip, rebuilt only when the outline changes.
+  // Reusable Path for the shape clip, rebuilt only when shape/size/layoutDirection change.
   private var clipPathCache: Path? = null
 
   // Legacy blur state (API < 31)
@@ -314,6 +331,11 @@ private class CloudyBackgroundModifierNode(
       this.cpuBlurEnabled != cpuBlurEnabled ||
       this.shape != shape
 
+    if (this.sky != sky && isAttached) {
+      this.sky.frameDriver.removeOverlay(reblur)
+      sky.frameDriver.addOverlay(reblur)
+    }
+
     this.sky = sky
     this.radius = radius
     this.progressive = progressive
@@ -336,6 +358,10 @@ private class CloudyBackgroundModifierNode(
     }
   }
 
+  override fun onAttach() {
+    sky.frameDriver.addOverlay(reblur)
+  }
+
   override fun onGloballyPositioned(coordinates: LayoutCoordinates) {
     positionInRoot = coordinates.positionInRoot()
   }
@@ -345,12 +371,19 @@ private class CloudyBackgroundModifierNode(
   }
 
   override fun ContentDrawScope.draw() {
-    // When `sky` is an ancestor of this overlay, the sky's capture pass re-enters this draw
-    // while recording the blur source into `backgroundLayer`. This overlay must be ABSENT from
-    // that source: if it drew here, its blur layer (which samples `backgroundLayer`) would be
-    // recorded into `backgroundLayer`, forming a cyclic RenderNode graph that crashes the render
-    // thread (https://github.com/skydoves/Cloudy/issues/112). Draw nothing during capture; the
-    // overlay paints itself in the sky's on-screen pass, when `isCapturing` is false.
+    // While THIS sky is being recorded (by any of its `Modifier.sky` recorders), this overlay draws
+    // NOTHING and returns. Two reasons it must be fully absent from the blur source:
+    //
+    // 1. Cycle prevention (https://github.com/skydoves/Cloudy/issues/112): drawing the blur layer
+    //    here would record a layer that samples a backdrop layer of this sky INTO the layer being
+    //    captured — a cyclic RenderNode graph that overflows the render thread stack.
+    // 2. Backdrop purity: a `cloudy` surface is a BACKGROUND-only material; its foreground (a glass
+    //    bar's title, nav-bar labels) lives OUTSIDE the `Modifier.sky` recorder, as a sibling of the
+    //    recorded content (see glassSurface KDoc). So during capture there is no foreground here to
+    //    preserve — calling `drawContent()` would only fold this overlay's own pixels back into the
+    //    backdrop it blurs, producing a brighter non-uniform "band" where its content sits.
+    //
+    // The capture counter is per-`Sky`, so independent skys are unaffected.
     if (sky.isCapturing) {
       return
     }
@@ -720,6 +753,7 @@ private class CloudyBackgroundModifierNode(
   }
 
   override fun onDetach() {
+    sky.frameDriver.removeOverlay(reblur)
     blurLayer?.let { requireGraphicsContext().releaseGraphicsLayer(it) }
     blurLayer = null
     cachedBlurEffect = null
